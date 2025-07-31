@@ -1,68 +1,55 @@
 import time
 import json
 import pandas as pd
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
+from dotenv import load_dotenv
 from pocketoptionapi.stable_api import PocketOption
 import pocketoptionapi.global_value as global_value
-from sklearn.ensemble import RandomForestClassifier
-
-
-###RESIPOTORY 6 HOUR LIMIT, avoid ob and os, with trend###
+from xgboost import XGBClassifier
 
 # Load environment variables
+load_dotenv()
 
 # Session configuration
 start_counter = time.perf_counter()
 
-ssid ='42["auth",{"session":"7onedcpaoiv8natb8jl7vp2728","isDemo":1,"uid":73357779,"platform":2,"isFastHistory":true,"isOptimized":true}]'
-
+ssid = '42["auth",{"session":"7onedcpaoiv8natb8jl7vp2728","isDemo":1,"uid":73357779,"platform":2,"isFastHistory":true,"isOptimized":true}]'
 demo = True
 
 # Bot Settings
-min_payout = 10
-period = 300 
-expiration = 300
+min_payout = 80
+period = 60 
+expiration = 60
 INITIAL_AMOUNT = 1
 MARTINGALE_LEVEL = 3
-MIN_ACTIVE_PAIRS = 4
-PROB_THRESHOLD = 0.77
-TAKE_PROFIT = 20  # <-- Take profit target in dollars
-current_profit = 0  # <-- Current cumulative profit
+MIN_ACTIVE_PAIRS = 2
+PROB_THRESHOLD = 0.76
+TAKE_PROFIT = 20
+current_profit = 0
 
-# Connect to Pocket Option
+
 api = PocketOption(ssid, demo)
 api.connect()
 
 FEATURE_COLS = ['RSI', 'k_percent', 'r_percent', 'MACD', 'MACD_EMA', 'Price_Rate_Of_Change']
 
-# Utility Functions
 def get_payout():
     try:
         d = json.loads(global_value.PayoutData)
         for pair in d:
             name = pair[1]
             payout = pair[5]
+            asset_type = pair[3]
             is_active = pair[14]
-            market_type = pair[3]  # digital or turbo
 
-            # Filter all OTC pairs with acceptable payout
-            if (
-                name.endswith("_otc") and
-                is_active and
-                len(name) == 10 and
-                payout >= min_payout
-            ):
-                global_value.pairs[name] = {
-                    'payout': payout,
-                    'type': market_type
-                }
-            else:
-                # Remove if no longer meets criteria
-                if name in global_value.pairs:
+            if not name.endswith("_otc") and asset_type == "currency" and is_active:
+                if payout >= min_payout:
+                    global_value.pairs[name] = {'payout': payout, 'type': asset_type}
+                elif name in global_value.pairs:
                     del global_value.pairs[name]
         return True
     except Exception as e:
-        print(f"Error fetching payouts: {e}")
+        global_value.logger(f"[ERROR]: Failed to parse payout data - {str(e)}", "ERROR")
         return False
 
 def get_df():
@@ -74,22 +61,6 @@ def get_df():
         return True
     except:
         return False
-
-def make_df(df0, history):
-    df1 = pd.DataFrame(history).sort_values(by='time').reset_index(drop=True)
-    df1['time'] = pd.to_datetime(df1['time'], unit='s', utc=True)
-    df1.set_index('time', inplace=True)
-    df = df1['price'].resample(f'{period}s').ohlc().reset_index()
-    if df0 is not None:
-        ts = datetime.timestamp(df.loc[0]['time'])
-        for x in range(len(df0)):
-            ts2 = datetime.timestamp(df0.loc[x]['time'])
-            if ts2 < ts:
-                df = df._append(df0.loc[x], ignore_index=True)
-            else:
-                break
-        df = df.sort_values(by='time').reset_index(drop=True)
-    return df
 
 def prepare_data(df):
     df = df[['time', 'open', 'high', 'low', 'close']]
@@ -131,7 +102,8 @@ def train_and_predict(df):
     X_train = df[FEATURE_COLS].iloc[:-1]
     y_train = df['Prediction'].iloc[:-1]
 
-    model = RandomForestClassifier(n_estimators=100, oob_score=True, criterion="gini", random_state=0)
+    # ✅ XGBoost Classifier
+    model = XGBClassifier()
     model.fit(X_train, y_train)
 
     X_test = df[FEATURE_COLS].iloc[[-1]]
@@ -160,6 +132,14 @@ def train_and_predict(df):
 def perform_trade(amount, pair, action, expiration):
     result = api.buy(amount=amount, active=pair, action=action, expirations=expiration)
     trade_id = result[1]
+
+    if result[0] is False or trade_id is None:
+        global_value.logger("❗Trade failed to execute. Attempting reconnection...", "ERROR")
+        api.disconnect()
+        time.sleep(2)
+        api.connect()
+        return None
+
     time.sleep(expiration)
     return api.check_win(trade_id)
 
@@ -194,11 +174,10 @@ def martingale_strategy(pair, action):
             current_profit -= amount
             global_value.logger(f"❌ LOSS - Profit: {current_profit:.2f} USD", "INFO")
 
-    # ✅ Check Take Profit
     if current_profit >= TAKE_PROFIT:
         global_value.logger(f"🎯 Take Profit Achieved! Cooling down for 1 hour... Final Profit: {current_profit:.2f} USD", "INFO")
-        time.sleep(3600)  # Sleep for 1 hour
-        current_profit = 0  # Reset profit tracker after cooldown
+        time.sleep(3600)
+        current_profit = 0
 
     if result[1] != 'loose':
         global_value.logger("WIN - Resetting to base amount.", "INFO")
@@ -220,11 +199,9 @@ def wait_for_candle_start():
             break
         time.sleep(0.1)
 
-# ✅ New timeout check function
 def near_github_timeout():
-    return (time.perf_counter() - start_counter) >= (6 * 3600 - 14 * 60)
+    return (time.perf_counter() - start_counter) >= (6 * 3600 - 20 * 60)
 
-# Strategy loop
 def strategie():
     pairs_snapshot = list(global_value.pairs.keys())
 
@@ -249,9 +226,11 @@ def strategie():
 
         wait_until_next_candle(period, 15)
 
-        df = make_df(global_value.pairs[pair].get('dataframe'), global_value.pairs[pair].get('history'))
+        df = global_value.pairs[pair].get('dataframe')
         if df is None or df.empty:
             continue
+
+        df = df.sort_values(by='time').reset_index(drop=True)
 
         global_value.logger(f"{len(df)} Candles collected for === {pair} === ({period // 60} mins timeframe)", "INFO")
 
@@ -260,8 +239,7 @@ def strategie():
             continue
 
         decision = train_and_predict(processed_df)
-       
-        
+
         if decision:
             latest_rsi = processed_df.iloc[-1]['RSI']
             if (decision == "call" and latest_rsi > 70) or (decision == "put" and latest_rsi < 30):
@@ -293,7 +271,6 @@ def start():
         while True:
             strategie()
 
-# Main entry
 if __name__ == "__main__":
     start()
     end_counter = time.perf_counter()
