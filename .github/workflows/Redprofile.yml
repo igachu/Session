@@ -2,7 +2,9 @@ name: Redprofile
 
 on:
   workflow_dispatch:    # Manual run
- 
+  schedule:             # Automatic re-run every 6 hours
+    - cron: "0 */6 * * *"  # At minute 0, every 6th hour
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
@@ -26,7 +28,5 @@ jobs:
 
 
     - name: Run the bot
-      env:
-        SSID: ${{ secrets.SSID }}
       run: |
         python i_gachu_3.py
