@@ -2,8 +2,6 @@ name: Redprofile
 
 on:
   workflow_dispatch:    # Manual run
-  schedule:             # Automatic re-run every 6 hours
-    - cron: "0 */6 * * *"  # At minute 0, every 6th hour
 
 jobs:
   run-bot:
