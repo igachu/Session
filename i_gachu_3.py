@@ -1,37 +1,59 @@
+import os
 import time
 import json
 import pandas as pd
+import pandas_ta as ta 
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from pocketoptionapi.stable_api import PocketOption
 import pocketoptionapi.global_value as global_value
-from xgboost import XGBClassifier
+from sklearn.ensemble import RandomForestClassifier
+import oandapyV20
+import oandapyV20.endpoints.instruments as instruments
 
 # Load environment variables
 load_dotenv()
 
-# Session configuration
-start_counter = time.perf_counter()
-
-ssid = '42["auth",{"session":"7onedcpaoiv8natb8jl7vp2728","isDemo":1,"uid":73357779,"platform":2,"isFastHistory":true,"isOptimized":true}]'
+# === Credentials ===
+ACCESS_TOKEN = os.getenv("OANDA_TOKEN")
+ACCOUNT_ID = os.getenv("OANDA_ID")
+ssid = os.getenv("PO_SSID")
 demo = True
 
 # Bot Settings
-min_payout = 80
-period = 60 
+min_payout = 70
+period = 60  
 expiration = 60
 INITIAL_AMOUNT = 1
 MARTINGALE_LEVEL = 3
-MIN_ACTIVE_PAIRS = 2
+MIN_ACTIVE_PAIRS = 1
 PROB_THRESHOLD = 0.76
-TAKE_PROFIT = 20
-current_profit = 0
-
 
 api = PocketOption(ssid, demo)
 api.connect()
+time.sleep(4)
 
 FEATURE_COLS = ['RSI', 'k_percent', 'r_percent', 'MACD', 'MACD_EMA', 'Price_Rate_Of_Change']
+
+def get_oanda_candles(pair, granularity="M1", count=550):
+    try:
+        client = oandapyV20.API(access_token=ACCESS_TOKEN)
+        params = {"granularity": granularity, "count": count}
+        r = instruments.InstrumentsCandles(instrument=pair, params=params)
+        client.request(r)
+        candles = r.response['candles']
+        df = pd.DataFrame([{
+            'time': c['time'],
+            'open': float(c['mid']['o']),
+            'high': float(c['mid']['h']),
+            'low': float(c['mid']['l']),
+            'close': float(c['mid']['c']),
+        } for c in candles])
+        df['time'] = pd.to_datetime(df['time'])
+        return df
+    except Exception as e:
+        global_value.logger(f"[ERROR]: OANDA candle fetch failed for {pair} - {str(e)}", "ERROR")
+        return None
 
 def get_payout():
     try:
@@ -55,46 +77,38 @@ def get_payout():
 def get_df():
     try:
         for i, pair in enumerate(global_value.pairs, 1):
-            df = api.get_candles(pair, period)
-            global_value.logger(f'{pair} ({i}/{len(global_value.pairs)})', "INFO")
+            oanda_pair = pair[:3] + "_" + pair[3:]  # e.g., EURUSD → EUR_USD
+            df = get_oanda_candles(oanda_pair, granularity="M1", count=100)
+
+            if df is not None:
+                global_value.pairs[pair]['dataframe'] = df
+                global_value.logger(f"[{i}/{len(global_value.pairs)}] {pair}: Fetched {len(df)} candles from OANDA", "INFO")
+            else:
+                global_value.logger(f"[{i}/{len(global_value.pairs)}] {pair}: Failed to fetch candles", "ERROR")
             time.sleep(1)
         return True
-    except:
+    except Exception as e:
+        global_value.logger(f"[ERROR]: Error in get_df() - {str(e)}", "ERROR")
         return False
 
 def prepare_data(df):
     df = df[['time', 'open', 'high', 'low', 'close']]
     df.rename(columns={'time': 'timestamp'}, inplace=True)
     df.sort_values(by='timestamp', inplace=True)
-    df['change_in_price'] = df['close'].diff()
 
-    rsi_period = 14
-    stochastic_period = 14
-    macd_ema_long = 26
-    macd_ema_short = 12
-    macd_signal = 9
-    roc_period = 9
+    df['RSI'] = ta.rsi(df['close'], length=14)
+    stoch = ta.stoch(df['high'], df['low'], df['close'], k=14, d=3)
+    df['k_percent'] = stoch['STOCHk_14_3_3']
+    df['r_percent'] = ta.willr(df['high'], df['low'], df['close'], length=14)
+    macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
+    df['MACD'] = macd['MACD_12_26_9']
+    df['MACD_EMA'] = macd['MACDs_12_26_9']
+    df['Price_Rate_Of_Change'] = ta.roc(df['close'], length=9)
+    supert = ta.supertrend(df['high'], df['low'], df['close'], length=10, multiplier=3.0)
+    df['SUPERT_10_3.0'] = supert['SUPERT_10_3.0']
+    df['SUPERTd_10_3.0'] = supert['SUPERTd_10_3.0']
 
-    up_df = df['change_in_price'].where(df['change_in_price'] > 0, 0)
-    down_df = abs(df['change_in_price'].where(df['change_in_price'] < 0, 0))
-    ewma_up = up_df.ewm(span=rsi_period).mean()
-    ewma_down = down_df.ewm(span=rsi_period).mean()
-    rs = ewma_up / ewma_down
-    df['RSI'] = 100.0 - (100.0 / (1.0 + rs))
-
-    df['low_14'] = df['low'].rolling(window=stochastic_period).min()
-    df['high_14'] = df['high'].rolling(window=stochastic_period).max()
-    df['k_percent'] = 100 * ((df['close'] - df['low_14']) / (df['high_14'] - df['low_14']))
-    df['r_percent'] = ((df['high_14'] - df['close']) / (df['high_14'] - df['low_14'])) * -100
-
-    ema_26 = df['close'].ewm(span=macd_ema_long).mean()
-    ema_12 = df['close'].ewm(span=macd_ema_short).mean()
-    df['MACD'] = ema_12 - ema_26
-    df['MACD_EMA'] = df['MACD'].ewm(span=macd_signal).mean()
-
-    df['Price_Rate_Of_Change'] = df['close'].pct_change(periods=roc_period)
     df['Prediction'] = (df['close'].shift(-1) > df['close']).astype(int)
-
     df.dropna(inplace=True)
     return df
 
@@ -102,8 +116,10 @@ def train_and_predict(df):
     X_train = df[FEATURE_COLS].iloc[:-1]
     y_train = df['Prediction'].iloc[:-1]
 
-    # ✅ XGBoost Classifier
-    model = XGBClassifier()
+ 
+    # global_value.logger("📊 Latest data preview:\n" + str(df.tail(1)[['timestamp', 'close','RSI', 'SUPERT_10_3.0', 'SUPERTd_10_3.0']]), "INFO")
+    global_value.logger("📊 Latest data preview:\n" + str(df.shape), "INFO")
+    model = RandomForestClassifier(n_estimators=100, oob_score=True, criterion="gini", random_state=0)
     model.fit(X_train, y_train)
 
     X_test = df[FEATURE_COLS].iloc[[-1]]
@@ -111,19 +127,31 @@ def train_and_predict(df):
     call_conf = proba[0][1]
     put_conf = 1 - call_conf
 
-    latest_close = df.iloc[-1]['close']
-    latest_ema26 = df['close'].ewm(span=26).mean().iloc[-1]
-
-    if call_conf > PROB_THRESHOLD and latest_close > latest_ema26:
-        decision = "call"
-        emoji = "🟢"
-        confidence = call_conf
-    elif put_conf > PROB_THRESHOLD and latest_close < latest_ema26:
-        decision = "put"
-        emoji = "🔴"
-        confidence = put_conf
+    latest_dir = df.iloc[-1]['SUPERTd_10_3.0']
+    current_trend = df.iloc[-1]['SUPERT_10_3.0']
+    past_trend = df.iloc[-3]['SUPERT_10_3.0']
+    
+    if call_conf > PROB_THRESHOLD:
+        if latest_dir == 1 and current_trend != past_trend:
+            decision = "call"
+            emoji = "🟢"
+            confidence = call_conf
+        else:
+            global_value.logger(f"⏭️ Skipping CALL ({call_conf:.2%}) due to trend mismatch or flat Supertrend.", "INFO")
+            return None
+    elif put_conf > PROB_THRESHOLD:
+        if latest_dir == -1 and current_trend != past_trend:
+            decision = "put"
+            emoji = "🔴"
+            confidence = put_conf
+        else:
+            global_value.logger(f"⏭️ Skipping PUT ({put_conf:.2%}) due to trend mismatch or flat Supertrend.", "INFO")
+            return None
     else:
-        global_value.logger("⏭️ Skipping trade due to low confidence or trend mismatch.", "INFO")
+        if call_conf > put_conf:
+            global_value.logger(f"⏭️ Skipping CALL due to low confidence ({call_conf:.2%})", "INFO")
+        else:
+            global_value.logger(f"⏭️ Skipping PUT due to low confidence ({put_conf:.2%})", "INFO")
         return None
 
     global_value.logger(f"{emoji} === PREDICTED: {decision.upper()} | CONFIDENCE: {confidence:.2%}", "INFO")
@@ -153,11 +181,6 @@ def martingale_strategy(pair, action):
     if result is None:
         return
 
-    if result[1] == 'win':
-        current_profit += amount * (global_value.pairs[pair]['payout'] / 100)
-    else:
-        current_profit -= amount
-
     while result[1] == 'loose' and level < MARTINGALE_LEVEL:
         level += 1
         amount *= 2
@@ -165,20 +188,7 @@ def martingale_strategy(pair, action):
 
         if result is None:
             return
-
-        if result[1] == 'win':
-            current_profit += amount * (global_value.pairs[pair]['payout'] / 100)
-            global_value.logger(f"✅ WIN - Profit: {current_profit:.2f} USD", "INFO")
-            break
-        else:
-            current_profit -= amount
-            global_value.logger(f"❌ LOSS - Profit: {current_profit:.2f} USD", "INFO")
-
-    if current_profit >= TAKE_PROFIT:
-        global_value.logger(f"🎯 Take Profit Achieved! Cooling down for 1 hour... Final Profit: {current_profit:.2f} USD", "INFO")
-        time.sleep(3600)
-        current_profit = 0
-
+        
     if result[1] != 'loose':
         global_value.logger("WIN - Resetting to base amount.", "INFO")
     else:
@@ -199,79 +209,47 @@ def wait_for_candle_start():
             break
         time.sleep(0.1)
 
-def near_github_timeout():
-    return (time.perf_counter() - start_counter) >= (6 * 3600 - 20 * 60)
+def main_trading_loop():
+    while True:
+        global_value.logger("🔄 Starting new trading cycle...", "INFO")
 
-def strategie():
-    pairs_snapshot = list(global_value.pairs.keys())
-
-    if len(pairs_snapshot) < MIN_ACTIVE_PAIRS:
-        time.sleep(60)
-        prepare()
-        return
-
-    for i, pair in enumerate(pairs_snapshot, 1):
-        live_pairs = list(global_value.pairs.keys())
-        if len(live_pairs) < MIN_ACTIVE_PAIRS:
-            time.sleep(60)
-            prepare()
-            return
-
-        if pair not in global_value.pairs:
+        if not get_payout():
+            global_value.logger("❗Failed to get payout data.", "ERROR")
+            time.sleep(5)
             continue
 
-        payout = global_value.pairs[pair].get('payout', 0)
-        if payout < min_payout:
-            continue
+        wait_until_next_candle(period_seconds=period, seconds_before=15)
+        global_value.logger("🕒 15 seconds before candle. Preparing data and predictions...", "INFO")
 
-        wait_until_next_candle(period, 15)
+        selected_pair = None
+        selected_action = None
 
-        df = global_value.pairs[pair].get('dataframe')
-        if df is None or df.empty:
-            continue
+        for pair in list(global_value.pairs.keys()):
+            oanda_pair = pair[:3] + "_" + pair[3:]
+            df = get_oanda_candles(oanda_pair)
 
-        df = df.sort_values(by='time').reset_index(drop=True)
-
-        global_value.logger(f"{len(df)} Candles collected for === {pair} === ({period // 60} mins timeframe)", "INFO")
-
-        processed_df = prepare_data(df.copy())
-        if processed_df.empty:
-            continue
-
-        decision = train_and_predict(processed_df)
-
-        if decision:
-            latest_rsi = processed_df.iloc[-1]['RSI']
-            if (decision == "call" and latest_rsi > 70) or (decision == "put" and latest_rsi < 30):
-                global_value.logger(f"Skipping {decision.upper()} due to RSI filter: RSI = {latest_rsi:.2f}", "INFO")
+            if df is None:
                 continue
 
-            if near_github_timeout():
-                global_value.logger("🕒 Near GitHub timeout. Skipping new trade to avoid interruption.", "INFO")
-                return
-            wait_for_candle_start()
-            martingale_strategy(pair, decision)
+            df = prepare_data(df)
+            decision = train_and_predict(df)
 
-            wait_until_next_candle(period, 60)
-            get_payout()
-            get_df()
+            if decision:
+                selected_pair = pair
+                selected_action = decision
+                global_value.logger(f"✅ Selected {pair} for {decision.upper()} trade.", "INFO")
+                break  # Stop at first valid signal
 
-def prepare():
-    try:
-        return get_payout() and get_df()
-    except:
-        return False
+        wait_for_candle_start()
 
-def start():
-    while not global_value.websocket_is_connected:
-        time.sleep(0.1)
-    time.sleep(2)
+        if selected_pair and selected_action:
+            global_value.logger(f"🚀 Executing trade on {selected_pair} - {selected_action.upper()}", "INFO")
+            martingale_strategy(selected_pair, selected_action)
+        else:
+            global_value.logger("⛔ No valid trading signal this cycle.", "INFO")
 
-    if prepare():
-        while True:
-            strategie()
+        # Optional: small pause before starting next cycle
+        time.sleep(2)
 
 if __name__ == "__main__":
-    start()
-    end_counter = time.perf_counter()
-    global_value.logger(f"CPU-bound Task Time: {int(end_counter - start_counter)} seconds", "INFO")
+    main_trading_loop()
